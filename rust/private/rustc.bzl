@@ -14,19 +14,18 @@
 
 """Functionality for constructing actions that invoke the Rust compiler"""
 
-load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
 load(
-    "@bazel_tools//tools/build_defs/cc:action_names.bzl",
+    "//third_party/bazel_rules/rules_cc/cc:action_names.bzl",
     "CPP_LINK_DYNAMIC_LIBRARY_ACTION_NAME",
     "CPP_LINK_EXECUTABLE_ACTION_NAME",
     "CPP_LINK_NODEPS_DYNAMIC_LIBRARY_ACTION_NAME",
     "CPP_LINK_STATIC_LIBRARY_ACTION_NAME",
 )
-load("//rust/private:common.bzl", "rust_common")
-load("//rust/private:providers.bzl", "RustcOutputDiagnosticsInfo", _BuildInfo = "BuildInfo")
-load("//rust/private:stamp.bzl", "is_stamping_enabled")
+load("//third_party/bazel_rules/rules_rust/rust/private:common.bzl", "rust_common")
+load("//third_party/bazel_rules/rules_rust/rust/private:providers.bzl", "RustcOutputDiagnosticsInfo", _BuildInfo = "BuildInfo")
+load("//third_party/bazel_rules/rules_rust/rust/private:stamp.bzl", "is_stamping_enabled")
 load(
-    "//rust/private:utils.bzl",
+    "//third_party/bazel_rules/rules_rust/rust/private:utils.bzl",
     "abs",
     "expand_dict_value_locations",
     "expand_list_element_locations",
@@ -38,6 +37,8 @@ load(
     "make_static_lib_symlink",
     "relativize",
 )
+load("//third_party/bazel_rules/rules_rust/rust/private/srcs_archive_support:defs.bzl", "maybe_generate_srcs_archive")
+load("//third_party/bazel_skylib/rules:common_settings.bzl", "BuildSettingInfo")
 
 BuildInfo = _BuildInfo
 
@@ -671,7 +672,12 @@ def collect_inputs(
     """
     linker_script = getattr(file, "linker_script") if hasattr(file, "linker_script") else None
 
-    linker_depset = cc_toolchain.linker_files()
+    # TODO(gnish): rules_rust is not coupled with Bazel release. Remove conditional and change to
+    # _linker_files once CcToolchainInfo changes are visible to Bazel.
+    if hasattr(cc_toolchain, "_linker_files"):
+        linker_depset = cc_toolchain._linker_files
+    else:
+        linker_depset = cc_toolchain.linker_files()
     compilation_mode = ctx.var["COMPILATION_MODE"]
 
     use_pic = _should_use_pic(cc_toolchain, feature_configuration, crate_info.type, compilation_mode)
@@ -999,7 +1005,7 @@ def construct_arguments(
         # Rust's built-in linker can handle linking wasm files. We don't want to attempt to use the cc
         # linker since it won't understand.
         compilation_mode = ctx.var["COMPILATION_MODE"]
-        if toolchain.target_arch != "wasm32":
+        if toolchain.target_arch != "wasm32" or True:
             if output_dir:
                 use_pic = _should_use_pic(cc_toolchain, feature_configuration, crate_info.type, compilation_mode)
                 rpaths = _compute_rpaths(toolchain, output_dir, dep_info, use_pic)
@@ -1185,6 +1191,13 @@ def rustc_compile_action(
     if experimental_use_cc_common_link:
         emit = ["obj"]
 
+    use_split_debuginfo = cc_common.is_enabled(feature_configuration = feature_configuration, feature_name = "per_object_debug_info") and ctx.fragments.cpp.fission_active_for_current_compilation_mode()
+    if use_split_debuginfo:
+        rust_flags = rust_flags + [
+            "--codegen=split-debuginfo=unpacked",
+            "--codegen=debuginfo=full",
+        ]
+
     args, env_from_args = construct_arguments(
         ctx = ctx,
         attr = attr,
@@ -1282,6 +1295,10 @@ def rustc_compile_action(
         elif toolchain.target_os == "darwin":
             dsym_folder = ctx.actions.declare_directory(crate_info.output.basename + ".dSYM", sibling = crate_info.output)
             action_outputs.append(dsym_folder)
+    if use_split_debuginfo:
+        dwo_outputs = ctx.actions.declare_directory(crate_info.name + "_fission", sibling = crate_info.output)
+        args.process_wrapper_flags.add("--kludge-move-dwo-to", dwo_outputs.path)
+        action_outputs.append(dwo_outputs)
 
     if ctx.executable._process_wrapper:
         # Run as normal
@@ -1298,7 +1315,7 @@ def rustc_compile_action(
                 formatted_version,
                 len(crate_info.srcs.to_list()),
             ),
-            toolchain = "@rules_rust//rust:toolchain_type",
+            toolchain = "//third_party/bazel_rules/rules_rust/rust:toolchain_type",
         )
         if args_metadata:
             ctx.actions.run(
@@ -1314,7 +1331,7 @@ def rustc_compile_action(
                     formatted_version,
                     len(crate_info.srcs.to_list()),
                 ),
-                toolchain = "@rules_rust//rust:toolchain_type",
+                toolchain = "//third_party/bazel_rules/rules_rust/rust:toolchain_type",
             )
     elif hasattr(ctx.executable, "_bootstrap_process_wrapper"):
         # Run without process_wrapper
@@ -1333,20 +1350,24 @@ def rustc_compile_action(
                 formatted_version,
                 len(crate_info.srcs.to_list()),
             ),
-            toolchain = "@rules_rust//rust:toolchain_type",
+            toolchain = "//third_party/bazel_rules/rules_rust/rust:toolchain_type",
         )
     else:
         fail("No process wrapper was defined for {}".format(ctx.label))
 
+    cco_args = {}
     if experimental_use_cc_common_link:
         # Wrap the main `.o` file into a compilation output suitable for
         # cc_common.link. The main `.o` file is useful in both PIC and non-PIC
         # modes.
-        compilation_outputs = cc_common.create_compilation_outputs(
-            objects = depset([output_o]),
-            pic_objects = depset([output_o]),
-        )
-
+        cco_args["objects"] = depset([output_o])
+        cco_args["pic_objects"] = depset([output_o])
+    if use_split_debuginfo:
+        cco_args["dwo_objects"] = depset([dwo_outputs])  # buildifier: disable=uninitialized
+        cco_args["pic_dwo_objects"] = depset([dwo_outputs])  # buildifier: disable=uninitialized
+    compilation_outputs = cc_common.create_compilation_outputs(**cco_args)
+    debug_context = cc_common.create_debug_context(compilation_outputs)
+    if experimental_use_cc_common_link:
         malloc_library = ctx.attr._custom_malloc or ctx.attr.malloc
 
         # Collect the linking contexts of the standard library and dependencies.
@@ -1359,6 +1380,10 @@ def rustc_compile_action(
         for dep in crate_info.deps.to_list():
             if dep.cc_info:
                 linking_contexts.append(dep.cc_info.linking_context)
+
+        # BEGIN GOOGLE3
+        linking_contexts.append(ctx.attr._google3_rust_okay_here[CcInfo].linking_context)
+        # END GOOGLE3
 
         # In the cc_common.link action we need to pass the name of the final
         # binary (output) relative to the package of this target.
@@ -1440,6 +1465,8 @@ def rustc_compile_action(
             "metadata_files": coverage_runfiles + [executable] if executable else [],
         })
 
+    outputs += maybe_generate_srcs_archive(ctx, crate_info)
+
     providers = [
         DefaultInfo(
             # nb. This field is required for cc_library to depend on our output.
@@ -1468,7 +1495,7 @@ def rustc_compile_action(
     else:
         providers.extend([crate_info, dep_info])
 
-    providers += establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_configuration, interface_library)
+    providers += establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_configuration, interface_library, debug_context)
 
     output_group_info = {}
 
@@ -1526,7 +1553,7 @@ def _collect_nonstatic_linker_inputs(cc_info):
             ))
     return shared_linker_inputs
 
-def establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_configuration, interface_library):
+def establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_configuration, interface_library, debug_context = None):
     """If the produced crate is suitable yield a CcInfo to allow for interop with cc rules
 
     Args:
@@ -1537,7 +1564,7 @@ def establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_co
         cc_toolchain (CcToolchainInfo): The current `CcToolchainInfo`
         feature_configuration (FeatureConfiguration): Feature configuration to be queried.
         interface_library (File): Optional interface library for cdylib crates on Windows.
-
+        debug_context (DebugContext): Optional debug context.
     Returns:
         list: A list containing the CcInfo provider
     """
@@ -1601,7 +1628,10 @@ def establish_cc_info(ctx, attr, crate_info, toolchain, cc_toolchain, feature_co
     )
 
     cc_infos = [
-        CcInfo(linking_context = linking_context),
+        CcInfo(
+            linking_context = linking_context,
+            debug_context = debug_context,
+        ),
         toolchain.stdlib_linkflags,
     ]
 
@@ -2070,7 +2100,7 @@ def _error_format_impl(ctx):
 error_format = rule(
     doc = (
         "Change the [--error-format](https://doc.rust-lang.org/rustc/command-line-arguments.html#option-error-format) " +
-        "flag from the command line with `--@rules_rust//:error_format`. See rustc documentation for valid values."
+        "flag from the command line with `--//third_party/bazel_rules/rules_rust/:error_format`. See rustc documentation for valid values."
     ),
     implementation = _error_format_impl,
     build_setting = config.string(flag = True),
@@ -2091,7 +2121,7 @@ def _rustc_output_diagnostics_impl(ctx):
 
 rustc_output_diagnostics = rule(
     doc = (
-        "Setting this flag from the command line with `--@rules_rust//:rustc_output_diagnostics` " +
+        "Setting this flag from the command line with `--//third_party/bazel_rules/rules_rust/:rustc_output_diagnostics` " +
         "makes rules_rust save rustc json output(suitable for consumption by rust-analyzer) in a file. " +
         "These are accessible via the " +
         "`rustc_rmeta_output`(for pipelined compilation) and `rustc_output` output groups. " +
@@ -2106,11 +2136,11 @@ def _extra_rustc_flags_impl(ctx):
 
 extra_rustc_flags = rule(
     doc = (
-        "Add additional rustc_flags from the command line with `--@rules_rust//:extra_rustc_flags`. " +
+        "Add additional rustc_flags from the command line with `--//third_party/bazel_rules/rules_rust/:extra_rustc_flags`. " +
         "This flag should only be used for flags that need to be applied across the entire build. For options that " +
         "apply to individual crates, use the rustc_flags attribute on the individual crate's rule instead. NOTE: " +
         "These flags not applied to the exec configuration (proc-macros, cargo_build_script, etc); " +
-        "use `--@rules_rust//:extra_exec_rustc_flags` to apply flags to the exec configuration."
+        "use `--//third_party/bazel_rules/rules_rust/:extra_exec_rustc_flags` to apply flags to the exec configuration."
     ),
     implementation = _extra_rustc_flags_impl,
     build_setting = config.string_list(flag = True),
@@ -2121,7 +2151,7 @@ def _extra_rustc_flag_impl(ctx):
 
 extra_rustc_flag = rule(
     doc = (
-        "Add additional rustc_flag from the command line with `--@rules_rust//:extra_rustc_flag`. " +
+        "Add additional rustc_flag from the command line with `--//third_party/bazel_rules/rules_rust/:extra_rustc_flag`. " +
         "Multiple uses are accumulated and appended after the extra_rustc_flags."
     ),
     implementation = _extra_rustc_flag_impl,
@@ -2133,7 +2163,7 @@ def _extra_exec_rustc_flags_impl(ctx):
 
 extra_exec_rustc_flags = rule(
     doc = (
-        "Add additional rustc_flags in the exec configuration from the command line with `--@rules_rust//:extra_exec_rustc_flags`. " +
+        "Add additional rustc_flags in the exec configuration from the command line with `--//third_party/bazel_rules/rules_rust/:extra_exec_rustc_flags`. " +
         "This flag should only be used for flags that need to be applied across the entire build. " +
         "These flags only apply to the exec configuration (proc-macros, cargo_build_script, etc)."
     ),
@@ -2146,7 +2176,7 @@ def _extra_exec_rustc_flag_impl(ctx):
 
 extra_exec_rustc_flag = rule(
     doc = (
-        "Add additional rustc_flags in the exec configuration from the command line with `--@rules_rust//:extra_exec_rustc_flag`. " +
+        "Add additional rustc_flags in the exec configuration from the command line with `--//third_party/bazel_rules/rules_rust/:extra_exec_rustc_flag`. " +
         "Multiple uses are accumulated and appended after the extra_exec_rustc_flags."
     ),
     implementation = _extra_exec_rustc_flag_impl,
@@ -2158,7 +2188,7 @@ def _per_crate_rustc_flag_impl(ctx):
 
 per_crate_rustc_flag = rule(
     doc = (
-        "Add additional rustc_flag to matching crates from the command line with `--@rules_rust//:experimental_per_crate_rustc_flag`. " +
+        "Add additional rustc_flag to matching crates from the command line with `--//third_party/bazel_rules/rules_rust/:experimental_per_crate_rustc_flag`. " +
         "The expected flag format is prefix_filter@flag, where any crate with a label or execution path starting with the prefix filter will be built with the given flag." +
         "The label matching uses the canonical form of the label (i.e //package:label_name)." +
         "The execution path is the relative path to your workspace directory including the base name (including extension) of the crate root." +
@@ -2180,7 +2210,7 @@ no_std = rule(
         "No std; we need this so that we can distinguish between host and exec"
     ),
     attrs = {
-        "_no_std": attr.label(default = "//:no_std"),
+        "_no_std": attr.label(default = "//third_party/bazel_rules/rules_rust:no_std"),
     },
     implementation = _no_std_impl,
 )
